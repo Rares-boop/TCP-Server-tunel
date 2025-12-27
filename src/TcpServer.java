@@ -11,14 +11,17 @@ import java.security.PrivateKey;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.crypto.SecretKey;
 
 public class TcpServer {
     public static final List<ClientHandler> clients = new ArrayList<>();
+    public static final ConcurrentHashMap<Integer, List<NetworkPacket>> offlineBuffer = new ConcurrentHashMap<>();
+
     public static final Gson gson = new Gson();
 
     public static void main(String[] args){
-        System.out.println("🟢 SERVER PORNIT - HYBRID MODE (Tunel + E2E Pass-Through)");
+        System.out.println("🟢 SERVER PORNIT - HYBRID BUFFERED MODE");
         new Thread(TcpServer::tcpServer).start();
     }
 
@@ -45,7 +48,7 @@ public class TcpServer {
         private int currentChatId = -1;
         private boolean isRunning = true;
 
-        private SecretKey sessionKey = null; // Cheia Tunel (Server-Client)
+        private SecretKey sessionKey = null;
         private PrivateKey tempKyberPrivate = null;
 
         public ClientHandler(Socket socket) {
@@ -58,12 +61,11 @@ public class TcpServer {
             }
         }
 
-        // AICI E LOGICA TA: Aceste pachete NU sunt criptate de Tunel pentru ca sunt deja criptate E2E
-        // sau sunt prea mari/complexe sa le mai impachetam o data.
         private boolean isExemptFromTunnel(PacketType type) {
             return type == PacketType.SEND_MESSAGE ||
                     type == PacketType.RECEIVE_MESSAGE ||
                     type == PacketType.GET_MESSAGES_RESPONSE ||
+                    type == PacketType.EXCHANGE_SESSION_KEY ||
                     type == PacketType.EDIT_MESSAGE_BROADCAST ||
                     type == PacketType.DELETE_MESSAGE_BROADCAST;
         }
@@ -71,7 +73,6 @@ public class TcpServer {
         @Override
         public void run() {
             try {
-                // 1. Handshake Initial (Kyber)
                 if (!performHandshake()) {
                     System.out.println("❌ Handshake Esuat.");
                     disconnect();
@@ -82,39 +83,38 @@ public class TcpServer {
                     String jsonRequest = (String) in.readObject();
                     NetworkPacket packet = NetworkPacket.fromJson(jsonRequest);
 
-                    // --- LOGICA HIBRIDA ---
-
-                    // CAZ 1: Pachet CRIPTAT prin TUNEL (Login, Create Chat, etc.)
                     if (packet.getType() == PacketType.SECURE_ENVELOPE) {
                         try {
                             String encryptedPayload = packet.getPayload().getAsString();
                             byte[] packedBytes = Base64.getDecoder().decode(encryptedPayload);
-                            String originalJson = CryptoHelper.unpackAndDecrypt(sessionKey, packedBytes);
 
-                            System.out.println("📥 [SERVER RECV] Pachet PRIMIT Criptat (AES): " + encryptedPayload);
+                            System.out.println("   📦 ENCRYPTED DATA: " + encryptedPayload);
+
+                            String originalJson = CryptoHelper.unpackAndDecrypt(sessionKey, packedBytes);
                             packet = NetworkPacket.fromJson(originalJson);
 
-                            // System.out.println("🔓 [TUNEL] Decriptat: " + packet.getType());
+                            System.out.println("   📄 Pachet Real: " + originalJson);
+
                         } catch (Exception e) {
                             System.out.println("🚨 Eroare decriptare Tunel!");
                             continue;
                         }
                     }
-                    // CAZ 2: Pachet NECRIPTAT (EXEMPT) - Mesajele E2E
-                    // Serverul le accepta asa cum sunt (JSON simplu), pentru ca payload-ul din ele e deja criptat de client
                     else if (isExemptFromTunnel(packet.getType())) {
-                        System.out.println("📨 [PASS-THROUGH] Pachet E2E acceptat direct: " + packet.getType());
+                        // Pass-through ok
                     }
-                    // CAZ 3: Pachet NECRIPTAT nepermis (Atac sau eroare)
                     else {
-                        System.out.println("⚠️ Pachet necriptat nepermis: " + packet.getType());
+                        System.out.println("⚠️ Pachet necriptat refuzat: " + packet.getType());
                         continue;
                     }
 
-                    // --- PROCESARE ---
                     switch (packet.getType()) {
                         case LOGIN_REQUEST: handleLogin(packet); break;
                         case REGISTER_REQUEST: handleRegister(packet); break;
+
+                        case EXCHANGE_SESSION_KEY: handleSessionKeyExchange(packet); break;
+                        case SEND_MESSAGE: handleSendMessage(packet); break;
+
                         case GET_CHATS_REQUEST: handleGetChats(); break;
                         case GET_USERS_REQUEST: handleGetUsersForAdd(); break;
                         case CREATE_CHAT_REQUEST: handleCreateChat(packet); break;
@@ -126,14 +126,11 @@ public class TcpServer {
                             sendPacket(PacketType.EXIT_CHAT_RESPONSE, "BYE");
                             break;
 
-                        // --- AICI MESAJUL VINE DEJA CRIPTAT E2E DE LA CLIENT ---
-                        case SEND_MESSAGE: handleSendMessage(packet); break;
-
                         case EDIT_MESSAGE_REQUEST: handleEditMessage(packet); break;
                         case DELETE_MESSAGE_REQUEST: handleDeleteMessage(packet); break;
                         case LOGOUT: disconnect(); break;
 
-                        default: System.out.println("Packet unknown: " + packet.getType());
+                        default: System.out.println("Unknown packet: " + packet.getType());
                     }
                 }
             } catch (Exception e) {
@@ -141,9 +138,152 @@ public class TcpServer {
             }
         }
 
+        private void handleLogin(NetworkPacket packet) throws IOException {
+            ChatDtos.AuthDto dto = gson.fromJson(packet.getPayload(), ChatDtos.AuthDto.class);
+            User user = Database.selectUserByUsername(dto.username);
+
+            if (user != null && PasswordUtils.verifyPassword(dto.password, user.getSalt(), user.getPasswordHash())) {
+                synchronized (clients) {
+                    for (ClientHandler c : clients) {
+                        if (c.currentUser != null && c.currentUser.getId() == user.getId()) {
+                            sendPacket(PacketType.LOGIN_RESPONSE, "ALREADY"); return;
+                        }
+                    }
+                    clients.add(this);
+                }
+                this.currentUser = user;
+                Database.insertUserLog(user.getId(), "LOGIN", System.currentTimeMillis(), socket.getInetAddress().getHostAddress());
+                sendPacket(PacketType.LOGIN_RESPONSE, user);
+
+                List<NetworkPacket> pending = offlineBuffer.remove(user.getId());
+
+                if (pending != null && !pending.isEmpty()) {
+                    System.out.println("📦 [SYNC] User " + user.getId() + " online. Livram " + pending.size() + " pachete din buffer.");
+                    for (NetworkPacket p : pending) {
+                        sendDirectPacket(p);
+                        try { Thread.sleep(10); } catch (InterruptedException e) {}
+                    }
+                }
+
+            } else {
+                sendPacket(PacketType.LOGIN_RESPONSE, "FAIL");
+            }
+        }
+
+        private void handleSessionKeyExchange(NetworkPacket packet) throws IOException {
+            ChatDtos.SessionKeyDto keyDto = gson.fromJson(packet.getPayload(), ChatDtos.SessionKeyDto.class);
+
+            System.out.println("\n🔑 [KEY EXCHANGE START]");
+            System.out.println("   ➡ Sender (Eu): " + currentUser.getId() + " (" + currentUser.getUsername() + ")");
+            System.out.println("   ➡ Chat ID: " + keyDto.chatId);
+
+            List<GroupMember> members = Database.selectGroupMembersByChatId(keyDto.chatId);
+
+            if (members == null || members.isEmpty()) {
+                System.out.println("❌ EROARE: Niciun membru in DB pentru chat-ul asta!");
+                return;
+            }
+
+            System.out.println("   📋 Membri gasiti in DB: " + members.size());
+
+            int targetId = -1;
+            for (GroupMember m : members) {
+                System.out.println("      ? Verific ID: " + m.getUserId());
+                if (m.getUserId() != currentUser.getId()) {
+                    targetId = m.getUserId();
+                    System.out.println("      ✅ ASTA E PARTENERUL! (ID: " + targetId + ")");
+                    break;
+                } else {
+                    System.out.println("      SKIP (Sunt eu)");
+                }
+            }
+
+            if (targetId == -1) {
+                System.out.println("❌ EROARE: Nu am gasit niciun partener (poate esti singur in grup?)");
+                return;
+            }
+
+            boolean sent = false;
+            NetworkPacket forwardPacket = new NetworkPacket(PacketType.EXCHANGE_SESSION_KEY, currentUser.getId(), keyDto);
+
+            synchronized (clients) {
+                for (ClientHandler client : clients) {
+                    if (client.currentUser != null && client.currentUser.getId() == targetId) {
+                        client.sendDirectPacket(forwardPacket);
+                        sent = true;
+                        System.out.println("🚀 [KEY] Cheie livrata LIVE catre Socket-ul lui User " + targetId);
+                        break;
+                    }
+                }
+            }
+
+            if (!sent) {
+                System.out.println("💤 [KEY] User " + targetId + " e OFFLINE. Bag cheia in Buffer.");
+                offlineBuffer.computeIfAbsent(targetId, k -> new ArrayList<>()).add(forwardPacket);
+                System.out.println("   📦 Buffer size pt user " + targetId + ": " + offlineBuffer.get(targetId).size());
+            }
+            System.out.println("[KEY EXCHANGE END]\n");
+        }
+
+        // --- CORE: MESSAGE ROUTING ---
+        private void handleSendMessage(NetworkPacket packet) throws IOException {
+            Message receivedMsg = gson.fromJson(packet.getPayload(), Message.class);
+            if (currentChatId == -1) return;
+
+            long timestamp = System.currentTimeMillis();
+
+            System.out.println("💬 [MESSAGE ROUTING] Am primit un mesaj de la User " + currentUser.getId());
+
+            int msgId = Database.insertMessageReturningId(
+                    receivedMsg.getContent(),
+                    timestamp,
+                    currentUser.getId(),
+                    currentChatId
+            );
+
+            Message fullMsg = new Message(msgId, receivedMsg.getContent(), timestamp, currentUser.getId(), currentChatId);
+
+            String encryptedPreview = Base64.getEncoder().encodeToString(fullMsg.getContent());
+            System.out.println("   🚫 CONTINUT (SERVERUL VEDE DOAR ASTA): " + encryptedPreview);
+
+            broadcastToPartner(currentChatId, PacketType.RECEIVE_MESSAGE, fullMsg);
+
+            sendPacket(PacketType.RECEIVE_MESSAGE, fullMsg);
+        }
+
+        private void broadcastToPartner(int chatId, PacketType type, Object payload) {
+            List<GroupMember> members = Database.selectGroupMembersByChatId(chatId);
+
+            for (GroupMember m : members) {
+                int targetId = m.getUserId();
+                if (targetId == currentUser.getId()) continue;
+
+                boolean sent = false;
+
+                NetworkPacket p = new NetworkPacket(type, currentUser.getId(), payload);
+
+                synchronized (clients) {
+                    for (ClientHandler client : clients) {
+                        if (client.currentUser != null && client.currentUser.getId() == targetId) {
+                            try {
+                                client.sendDirectPacket(p);
+                                sent = true;
+                            } catch (IOException e) {}
+                            break;
+                        }
+                    }
+                }
+
+                if (!sent) {
+                    System.out.println("💤 [MSG] User " + targetId + " offline. Mesaj salvat in Buffer.");
+                    offlineBuffer.computeIfAbsent(targetId, k -> new ArrayList<>()).add(p);
+                }
+            }
+        }
+
         private boolean performHandshake() {
             try {
-                System.out.println("⏳ Start Handshake Kyber...");
+                System.out.println("⏳ Handshake...");
                 KeyPair kyberPair = CryptoHelper.generateKyberKeys();
                 this.tempKyberPrivate = kyberPair.getPrivate();
                 byte[] pubBytes = kyberPair.getPublic().getEncoded();
@@ -160,40 +300,40 @@ public class TcpServer {
                     byte[] wrappedBytes = Base64.getDecoder().decode(wrappedKeyBase64);
                     this.sessionKey = CryptoHelper.decapsulate(this.tempKyberPrivate, wrappedBytes);
                     this.tempKyberPrivate = null;
-                    System.out.println("✅ TUNEL ACTIVAT!");
+                    System.out.println("✅ Tunel OK!");
                     return true;
                 }
                 return false;
             } catch (Exception e) { return false; }
         }
 
-        // --- HANDLERS ---
+        // --- UTILS ---
+        private void sendPacket(PacketType type, Object payload) throws IOException {
+            int myId = (currentUser != null) ? currentUser.getId() : 0;
+            NetworkPacket p = new NetworkPacket(type, myId, payload);
+            sendDirectPacket(p);
+        }
 
-        private void handleLogin(NetworkPacket packet) throws IOException {
-            ChatDtos.AuthDto dto = gson.fromJson(packet.getPayload(), ChatDtos.AuthDto.class);
-            User user = Database.selectUserByUsername(dto.username);
-            if (user != null && PasswordUtils.verifyPassword(dto.password, user.getSalt(), user.getPasswordHash())) {
-                synchronized (clients) {
-                    for (ClientHandler c : clients) {
-                        if (c.currentUser != null && c.currentUser.getId() == user.getId()) {
-                            sendPacket(PacketType.LOGIN_RESPONSE, "ALREADY"); return;
-                        }
-                    }
-                    clients.add(this);
-                }
-                this.currentUser = user;
-                Database.insertUserLog(user.getId(), "LOGIN", System.currentTimeMillis(), socket.getInetAddress().getHostAddress());
-                sendPacket(PacketType.LOGIN_RESPONSE, user);
+        private void sendDirectPacket(NetworkPacket p) throws IOException {
+            if (isExemptFromTunnel(p.getType())) {
+                synchronized (out) { out.writeObject(p.toJson()); out.flush(); }
+            } else if (sessionKey != null) {
+                try {
+                    String clearJson = p.toJson();
+                    byte[] encryptedBytes = CryptoHelper.encryptAndPack(sessionKey, clearJson);
+                    String encryptedBase64 = Base64.getEncoder().encodeToString(encryptedBytes);
+                    NetworkPacket envelope = new NetworkPacket(PacketType.SECURE_ENVELOPE, p.getSenderId(), encryptedBase64);
+                    synchronized (out) { out.writeObject(envelope.toJson()); out.flush(); }
+                } catch (Exception e) { e.printStackTrace(); }
             } else {
-                sendPacket(PacketType.LOGIN_RESPONSE, "FAIL");
+                synchronized (out) { out.writeObject(p.toJson()); out.flush(); }
             }
         }
 
+        // Standard handlers
         private void handleRegister(NetworkPacket packet) throws IOException {
             ChatDtos.AuthDto dto = gson.fromJson(packet.getPayload(), ChatDtos.AuthDto.class);
-            if (Database.selectUserByUsername(dto.username) != null) {
-                sendPacket(PacketType.REGISTER_RESPONSE, "EXISTS"); return;
-            }
+            if (Database.selectUserByUsername(dto.username) != null) { sendPacket(PacketType.REGISTER_RESPONSE, "EXISTS"); return; }
             String salt = PasswordUtils.generateSalt(50);
             String hash = PasswordUtils.hashPassword(dto.password, salt);
             Database.insertUser(dto.username, hash, salt, System.currentTimeMillis());
@@ -202,160 +342,11 @@ public class TcpServer {
             synchronized (clients) { clients.add(this); }
             sendPacket(PacketType.REGISTER_RESPONSE, newUser);
         }
-
-        private void handleSendMessage(NetworkPacket packet) throws IOException {
-            // Serverul primeste un JSON SEND_MESSAGE.
-            // Payload-ul din interior (byte[]) este CRIPTAT CU CHEIA LOR (E2E).
-            // Serverul NU POATE sa il citeasca. Doar il salveaza blob.
-
-            Message receivedMsg = gson.fromJson(packet.getPayload(), Message.class);
-
-            if (currentChatId == -1) return;
-
-            long timestamp = System.currentTimeMillis();
-
-            // Salvam BLOB-ul criptat in baza de date
-            int msgId = Database.insertMessageReturningId(
-                    receivedMsg.getContent(), // Asta e deja criptat AES Client-Client
-                    timestamp,
-                    currentUser.getId(),
-                    currentChatId
-            );
-
-            // Construim obiectul complet
-            Message fullMsg = new Message(msgId, receivedMsg.getContent(), timestamp, currentUser.getId(), currentChatId);
-
-            // Trimitem la partener (FARA TUNEL, ca e in lista de EXEMPT)
-            broadcastToPartner(currentChatId, PacketType.RECEIVE_MESSAGE, fullMsg);
-
-            // Trimitem inapoi mie (confirmare)
-            sendPacket(PacketType.RECEIVE_MESSAGE, fullMsg);
-        }
-
-        // --- CORE: TRIMITERE ---
-
-        private void sendPacket(PacketType type, Object payload) throws IOException {
-            int myId = (currentUser != null) ? currentUser.getId() : 0;
-            NetworkPacket p = new NetworkPacket(type, myId, payload);
-            sendDirectPacket(p);
-        }
-
-        private void sendDirectPacket(NetworkPacket p) throws IOException {
-            // VERIFICARE CRITICA:
-            // Daca pachetul e EXEMPT (Mesaj E2E) -> IL TRIMITEM "GOL" (fara Secure Envelope)
-            // Daca pachetul e NORMAL (Login, etc) -> IL CRIPTAM CU TUNEL
-
-            if (isExemptFromTunnel(p.getType())) {
-                // PASS-THROUGH (Mesajul e deja securizat de client)
-                synchronized (out) {
-                    out.writeObject(p.toJson());
-                    out.flush();
-                }
-            } else if (sessionKey != null) {
-                // TUNEL (Securizam metadatele)
-                try {
-                    String clearJson = p.toJson();
-                    byte[] encryptedBytes = CryptoHelper.encryptAndPack(sessionKey, clearJson);
-                    String encryptedBase64 = Base64.getEncoder().encodeToString(encryptedBytes);
-
-                    System.out.println("📤 [SERVER SEND] Trimit Criptat (" + p.getType() + "): " + encryptedBase64);
-                    NetworkPacket envelope = new NetworkPacket(PacketType.SECURE_ENVELOPE, p.getSenderId(), encryptedBase64);
-
-                    synchronized (out) {
-                        out.writeObject(envelope.toJson());
-                        out.flush();
-                    }
-                } catch (Exception e) { e.printStackTrace(); }
-            } else {
-                // Handshake (cand nu avem cheie inca)
-                synchronized (out) {
-                    out.writeObject(p.toJson());
-                    out.flush();
-                }
-            }
-        }
-
-        // --- RESTUL ---
-        private void broadcastToPartner(int chatId, PacketType type, Object payload) {
-            System.out.println("\n--- 📢 START BROADCAST (ChatID: " + chatId + ") ---");
-            System.out.println("Sunt UserID: " + currentUser.getId() + " (" + currentUser.getUsername() + ")");
-
-            // 1. Luam membrii din DB
-            List<GroupMember> members = Database.selectGroupMembersByChatId(chatId);
-
-            if (members == null || members.isEmpty()) {
-                System.out.println("❌ EROARE CRITICA: DB-ul zice ca nu sunt membri in grupul asta!");
-                System.out.println("--- 🛑 END BROADCAST ---\n");
-                return;
-            }
-
-            System.out.println("📋 Membri in grup (din DB): " + members.size());
-
-            // Afisam cine e conectat la server in acest moment (RAM)
-            synchronized (clients) {
-                System.out.print("🔌 Useri Conectati la Server (Socketi activi): [ ");
-                for (ClientHandler c : clients) {
-                    if (c.currentUser != null) {
-                        System.out.print(c.currentUser.getId() + " ");
-                    } else {
-                        System.out.print("?(nelogat) ");
-                    }
-                }
-                System.out.println("]");
-            }
-
-            // 2. Iteram prin membri
-            for (GroupMember m : members) {
-                int targetId = m.getUserId();
-                System.out.println("   👉 Verific membrul ID: " + targetId);
-
-                // Il sarim pe cel care a trimis (eu)
-                if (targetId == currentUser.getId()) {
-                    System.out.println("      Skipping: Sunt eu.");
-                    continue;
-                }
-
-                boolean sent = false;
-
-                // Cautam user-ul in lista de socket-uri
-                synchronized (clients) {
-                    for (ClientHandler client : clients) {
-                        if (client.currentUser != null && client.currentUser.getId() == targetId) {
-                            try {
-                                System.out.println("      ✅ GASIT ONLINE! Trimit pachet...");
-
-                                NetworkPacket p = new NetworkPacket(type, currentUser.getId(), payload);
-                                client.sendDirectPacket(p);
-
-                                sent = true;
-                                System.out.println("      📨 Pachet livrat pe socket.");
-                            } catch (IOException e) {
-                                System.out.println("      ❌ Eroare socket: " + e.getMessage());
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                if (!sent) {
-                    System.out.println("      💤 Userul ID " + targetId + " este OFFLINE (nu e in lista de socketi).");
-                }
-            }
-            System.out.println("--- 🏁 END BROADCAST ---\n");
-        }
-
-        // Metode standard (create, enter, etc) ramase la fel...
-        private void handleGetChats() throws IOException {
-            if (currentUser == null) return;
-            sendPacket(PacketType.GET_CHATS_RESPONSE, Database.selectGroupChatsByUserId(currentUser.getId()));
-        }
+        private void handleGetChats() throws IOException { if (currentUser != null) sendPacket(PacketType.GET_CHATS_RESPONSE, Database.selectGroupChatsByUserId(currentUser.getId())); }
         private void handleGetUsersForAdd() throws IOException {
             List<String> rawUsers = Database.selectUsersAddConversation();
             List<String> filtered = new ArrayList<>();
-            for (String u : rawUsers) {
-                int uid = Integer.parseInt(u.split(",")[0]);
-                if (uid != currentUser.getId() && uid != -1) filtered.add(u);
-            }
+            for (String u : rawUsers) { int uid = Integer.parseInt(u.split(",")[0]); if (uid != currentUser.getId() && uid != -1) filtered.add(u); }
             sendPacket(PacketType.GET_USERS_RESPONSE, filtered);
         }
         private void handleCreateChat(NetworkPacket packet) throws IOException {
@@ -373,7 +364,6 @@ public class TcpServer {
             this.currentChatId = chatId;
             sendPacket(PacketType.ENTER_CHAT_RESPONSE, "OK");
             List<Message> history = Database.selectMessagesByGroup(chatId);
-            // Istoricul vine prin EXEMPT (deja criptat in DB)
             sendPacket(PacketType.GET_MESSAGES_RESPONSE, history);
         }
         private void handleRenameChat(NetworkPacket packet) throws IOException {
@@ -404,7 +394,6 @@ public class TcpServer {
                 }
             }
         }
-
         private void disconnect() {
             isRunning = false;
             synchronized (clients) { clients.remove(this); }
