@@ -21,7 +21,7 @@ public class TcpServer {
     public static final Gson gson = new Gson();
 
     public static void main(String[] args){
-        System.out.println("🟢 SERVER PORNIT - HYBRID BUFFERED MODE");
+        System.out.println("SERVER PORNIT");
         new Thread(TcpServer::tcpServer).start();
     }
 
@@ -74,7 +74,7 @@ public class TcpServer {
         public void run() {
             try {
                 if (!performHandshake()) {
-                    System.out.println("❌ Handshake Esuat.");
+                    System.out.println("Handshake Esuat.");
                     disconnect();
                     return;
                 }
@@ -88,15 +88,15 @@ public class TcpServer {
                             String encryptedPayload = packet.getPayload().getAsString();
                             byte[] packedBytes = Base64.getDecoder().decode(encryptedPayload);
 
-                            System.out.println("   📦 ENCRYPTED DATA: " + encryptedPayload);
+                            System.out.println("ENCRYPTED DATA: " + encryptedPayload);
 
                             String originalJson = CryptoHelper.unpackAndDecrypt(sessionKey, packedBytes);
                             packet = NetworkPacket.fromJson(originalJson);
 
-                            System.out.println("   📄 Pachet Real: " + originalJson);
+                            System.out.println("Pachet Real: " + originalJson);
 
                         } catch (Exception e) {
-                            System.out.println("🚨 Eroare decriptare Tunel!");
+                            System.out.println("Eroare decriptare Tunel!");
                             continue;
                         }
                     }
@@ -104,7 +104,7 @@ public class TcpServer {
                         // Pass-through ok
                     }
                     else {
-                        System.out.println("⚠️ Pachet necriptat refuzat: " + packet.getType());
+                        System.out.println("Pachet necriptat refuzat: " + packet.getType());
                         continue;
                     }
 
@@ -158,7 +158,7 @@ public class TcpServer {
                 List<NetworkPacket> pending = offlineBuffer.remove(user.getId());
 
                 if (pending != null && !pending.isEmpty()) {
-                    System.out.println("📦 [SYNC] User " + user.getId() + " online. Livram " + pending.size() + " pachete din buffer.");
+                    System.out.println("[SYNC] User " + user.getId() + " online. Livram " + pending.size() + " pachete din buffer.");
                     for (NetworkPacket p : pending) {
                         sendDirectPacket(p);
                         try { Thread.sleep(10); } catch (InterruptedException e) {}
@@ -173,33 +173,33 @@ public class TcpServer {
         private void handleSessionKeyExchange(NetworkPacket packet) throws IOException {
             ChatDtos.SessionKeyDto keyDto = gson.fromJson(packet.getPayload(), ChatDtos.SessionKeyDto.class);
 
-            System.out.println("\n🔑 [KEY EXCHANGE START]");
-            System.out.println("   ➡ Sender (Eu): " + currentUser.getId() + " (" + currentUser.getUsername() + ")");
-            System.out.println("   ➡ Chat ID: " + keyDto.chatId);
+            System.out.println("\n[KEY EXCHANGE START]");
+            System.out.println("Sender (Eu): " + currentUser.getId() + " (" + currentUser.getUsername() + ")");
+            System.out.println("Chat ID: " + keyDto.chatId);
 
             List<GroupMember> members = Database.selectGroupMembersByChatId(keyDto.chatId);
 
             if (members == null || members.isEmpty()) {
-                System.out.println("❌ EROARE: Niciun membru in DB pentru chat-ul asta!");
+                System.out.println("EROARE: Niciun membru in DB pentru chat-ul asta!");
                 return;
             }
 
-            System.out.println("   📋 Membri gasiti in DB: " + members.size());
+            System.out.println("Membri gasiti in DB: " + members.size());
 
             int targetId = -1;
             for (GroupMember m : members) {
-                System.out.println("      ? Verific ID: " + m.getUserId());
+                System.out.println("? Verific ID: " + m.getUserId());
                 if (m.getUserId() != currentUser.getId()) {
                     targetId = m.getUserId();
-                    System.out.println("      ✅ ASTA E PARTENERUL! (ID: " + targetId + ")");
+                    System.out.println("ASTA E PARTENERUL! (ID: " + targetId + ")");
                     break;
                 } else {
-                    System.out.println("      SKIP (Sunt eu)");
+                    System.out.println("SKIP (Sunt eu)");
                 }
             }
 
             if (targetId == -1) {
-                System.out.println("❌ EROARE: Nu am gasit niciun partener (poate esti singur in grup?)");
+                System.out.println("EROARE: Nu am gasit niciun partener (poate esti singur in grup?)");
                 return;
             }
 
@@ -211,28 +211,27 @@ public class TcpServer {
                     if (client.currentUser != null && client.currentUser.getId() == targetId) {
                         client.sendDirectPacket(forwardPacket);
                         sent = true;
-                        System.out.println("🚀 [KEY] Cheie livrata LIVE catre Socket-ul lui User " + targetId);
+                        System.out.println("[KEY] Cheie livrata LIVE catre Socket-ul lui User " + targetId);
                         break;
                     }
                 }
             }
 
             if (!sent) {
-                System.out.println("💤 [KEY] User " + targetId + " e OFFLINE. Bag cheia in Buffer.");
+                System.out.println("[KEY] User " + targetId + " e OFFLINE. Bag cheia in Buffer.");
                 offlineBuffer.computeIfAbsent(targetId, k -> new ArrayList<>()).add(forwardPacket);
-                System.out.println("   📦 Buffer size pt user " + targetId + ": " + offlineBuffer.get(targetId).size());
+                System.out.println("Buffer size pt user " + targetId + ": " + offlineBuffer.get(targetId).size());
             }
             System.out.println("[KEY EXCHANGE END]\n");
         }
 
-        // --- CORE: MESSAGE ROUTING ---
         private void handleSendMessage(NetworkPacket packet) throws IOException {
             Message receivedMsg = gson.fromJson(packet.getPayload(), Message.class);
             if (currentChatId == -1) return;
 
             long timestamp = System.currentTimeMillis();
 
-            System.out.println("💬 [MESSAGE ROUTING] Am primit un mesaj de la User " + currentUser.getId());
+            System.out.println("[MESSAGE ROUTING] Am primit un mesaj de la User " + currentUser.getId());
 
             int msgId = Database.insertMessageReturningId(
                     receivedMsg.getContent(),
@@ -244,7 +243,7 @@ public class TcpServer {
             Message fullMsg = new Message(msgId, receivedMsg.getContent(), timestamp, currentUser.getId(), currentChatId);
 
             String encryptedPreview = Base64.getEncoder().encodeToString(fullMsg.getContent());
-            System.out.println("   🚫 CONTINUT (SERVERUL VEDE DOAR ASTA): " + encryptedPreview);
+            System.out.println("CONTINUT (SERVERUL VEDE DOAR ASTA): " + encryptedPreview);
 
             broadcastToPartner(currentChatId, PacketType.RECEIVE_MESSAGE, fullMsg);
 
@@ -275,7 +274,7 @@ public class TcpServer {
                 }
 
                 if (!sent) {
-                    System.out.println("💤 [MSG] User " + targetId + " offline. Mesaj salvat in Buffer.");
+                    System.out.println("[MSG] User " + targetId + " offline. Mesaj salvat in Buffer.");
                     offlineBuffer.computeIfAbsent(targetId, k -> new ArrayList<>()).add(p);
                 }
             }
@@ -283,7 +282,7 @@ public class TcpServer {
 
         private boolean performHandshake() {
             try {
-                System.out.println("⏳ Handshake...");
+                System.out.println("Handshake...");
                 KeyPair kyberPair = CryptoHelper.generateKyberKeys();
                 this.tempKyberPrivate = kyberPair.getPrivate();
                 byte[] pubBytes = kyberPair.getPublic().getEncoded();
@@ -300,14 +299,13 @@ public class TcpServer {
                     byte[] wrappedBytes = Base64.getDecoder().decode(wrappedKeyBase64);
                     this.sessionKey = CryptoHelper.decapsulate(this.tempKyberPrivate, wrappedBytes);
                     this.tempKyberPrivate = null;
-                    System.out.println("✅ Tunel OK!");
+                    System.out.println("Tunel OK!");
                     return true;
                 }
                 return false;
             } catch (Exception e) { return false; }
         }
 
-        // --- UTILS ---
         private void sendPacket(PacketType type, Object payload) throws IOException {
             int myId = (currentUser != null) ? currentUser.getId() : 0;
             NetworkPacket p = new NetworkPacket(type, myId, payload);
@@ -349,16 +347,7 @@ public class TcpServer {
             for (String u : rawUsers) { int uid = Integer.parseInt(u.split(",")[0]); if (uid != currentUser.getId() && uid != -1) filtered.add(u); }
             sendPacket(PacketType.GET_USERS_RESPONSE, filtered);
         }
-        /*private void handleCreateChat(NetworkPacket packet) throws IOException {
-            ChatDtos.CreateGroupDto dto = gson.fromJson(packet.getPayload(), ChatDtos.CreateGroupDto.class);
-            Database.insertGroupChat(dto.groupName);
-            GroupChat newChat = Database.selectGroupChatByName(dto.groupName);
-            if (newChat != null) {
-                Database.insertGroupMember(newChat.getId(), currentUser.getId());
-                Database.insertGroupMember(newChat.getId(), dto.targetUserId);
-                sendPacket(PacketType.CREATE_CHAT_RESPONSE, newChat);
-            }
-        }*/
+
         private void handleEnterChat(NetworkPacket packet) throws IOException {
             int chatId = gson.fromJson(packet.getPayload(), Integer.class);
             this.currentChatId = chatId;
@@ -366,16 +355,6 @@ public class TcpServer {
             List<Message> history = Database.selectMessagesByGroup(chatId);
             sendPacket(PacketType.GET_MESSAGES_RESPONSE, history);
         }
-        /*private void handleRenameChat(NetworkPacket packet) throws IOException {
-            ChatDtos.RenameGroupDto dto = gson.fromJson(packet.getPayload(), ChatDtos.RenameGroupDto.class);
-            Database.updateGroupChatName(dto.chatId, dto.newName);
-            sendPacket(PacketType.RENAME_CHAT_RESPONSE, "OK");
-        }
-        private void handleDeleteChat(NetworkPacket packet) throws IOException {
-            int chatId = gson.fromJson(packet.getPayload(), Integer.class);
-            Database.deleteGroupChatTransactional(chatId);
-            sendPacket(PacketType.DELETE_CHAT_RESPONSE, "OK");
-        }*/
 
         private void handleCreateChat(NetworkPacket packet) throws IOException {
             ChatDtos.CreateGroupDto dto = gson.fromJson(packet.getPayload(), ChatDtos.CreateGroupDto.class);
@@ -383,17 +362,12 @@ public class TcpServer {
             GroupChat newChat = Database.selectGroupChatByName(dto.groupName);
 
             if (newChat != null) {
-                // 1. Adaugam membrii
                 Database.insertGroupMember(newChat.getId(), currentUser.getId());
                 Database.insertGroupMember(newChat.getId(), dto.targetUserId);
 
-                // Construim pachetul de Broadcast
                 NetworkPacket broadcastPacket = new NetworkPacket(PacketType.CREATE_CHAT_BROADCAST, currentUser.getId(), newChat);
-
-                // 2. IMI TRIMITE MIE (Ca sa apara in lista mea prin mecanismul de broadcast)
                 sendDirectPacket(broadcastPacket);
 
-                // 3. TRIMITE PARTENERULUI
                 sendToSpecificUser(dto.targetUserId, broadcastPacket);
             }
         }
@@ -401,35 +375,22 @@ public class TcpServer {
         private void handleRenameChat(NetworkPacket packet) throws IOException {
             ChatDtos.RenameGroupDto dto = gson.fromJson(packet.getPayload(), ChatDtos.RenameGroupDto.class);
 
-            // 1. Update DB
             Database.updateGroupChatName(dto.chatId, dto.newName);
-
-            // Construim pachetul de Broadcast
             NetworkPacket broadcastPacket = new NetworkPacket(PacketType.RENAME_CHAT_BROADCAST, currentUser.getId(), dto);
 
-            // 2. IMI TRIMITE MIE (Ca sa se actualizeze numele in lista mea)
             sendDirectPacket(broadcastPacket);
-
-            // 3. BROADCAST CELORLALTI MEMBRI (Helperul meu sare peste sender, deci e perfect sa-l apelam dupa ce ne trimitem noua)
             broadcastToChatMembers(dto.chatId, PacketType.RENAME_CHAT_BROADCAST, dto);
         }
 
         private void handleDeleteChat(NetworkPacket packet) throws IOException {
             int chatId = gson.fromJson(packet.getPayload(), Integer.class);
 
-            // !!! LUAM MEMBRII INAINTE SA STERGEM CHATUL DIN DB !!!
             List<GroupMember> members = Database.selectGroupMembersByChatId(chatId);
-
-            // 1. Stergerea efectiva
             Database.deleteGroupChatTransactional(chatId);
 
-            // Construim pachetul de Broadcast
             NetworkPacket broadcastPacket = new NetworkPacket(PacketType.DELETE_CHAT_BROADCAST, currentUser.getId(), chatId);
-
-            // 2. IMI TRIMITE MIE (Ca sa dispara din lista mea)
             sendDirectPacket(broadcastPacket);
 
-            // 3. BROADCAST MANUAL CELORLALTI
             if (members != null) {
                 for (GroupMember m : members) {
                     if (m.getUserId() != currentUser.getId()) {
@@ -439,7 +400,6 @@ public class TcpServer {
             }
         }
 
-        // --- HELPER NOU CA SA NU SCRII COD DUPLICAT ---
         private void sendToSpecificUser(int targetUserId, NetworkPacket p) {
             synchronized (clients) {
                 for (ClientHandler client : clients) {
@@ -451,7 +411,6 @@ public class TcpServer {
             }
         }
 
-        // --- HELPER PENTRU GRUPURI (Folosit la Rename) ---
         private void broadcastToChatMembers(int chatId, PacketType type, Object payload) {
             List<GroupMember> members = Database.selectGroupMembersByChatId(chatId);
             if (members == null) return;
