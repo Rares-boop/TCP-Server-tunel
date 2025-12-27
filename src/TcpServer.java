@@ -349,7 +349,7 @@ public class TcpServer {
             for (String u : rawUsers) { int uid = Integer.parseInt(u.split(",")[0]); if (uid != currentUser.getId() && uid != -1) filtered.add(u); }
             sendPacket(PacketType.GET_USERS_RESPONSE, filtered);
         }
-        private void handleCreateChat(NetworkPacket packet) throws IOException {
+        /*private void handleCreateChat(NetworkPacket packet) throws IOException {
             ChatDtos.CreateGroupDto dto = gson.fromJson(packet.getPayload(), ChatDtos.CreateGroupDto.class);
             Database.insertGroupChat(dto.groupName);
             GroupChat newChat = Database.selectGroupChatByName(dto.groupName);
@@ -358,7 +358,7 @@ public class TcpServer {
                 Database.insertGroupMember(newChat.getId(), dto.targetUserId);
                 sendPacket(PacketType.CREATE_CHAT_RESPONSE, newChat);
             }
-        }
+        }*/
         private void handleEnterChat(NetworkPacket packet) throws IOException {
             int chatId = gson.fromJson(packet.getPayload(), Integer.class);
             this.currentChatId = chatId;
@@ -366,7 +366,7 @@ public class TcpServer {
             List<Message> history = Database.selectMessagesByGroup(chatId);
             sendPacket(PacketType.GET_MESSAGES_RESPONSE, history);
         }
-        private void handleRenameChat(NetworkPacket packet) throws IOException {
+        /*private void handleRenameChat(NetworkPacket packet) throws IOException {
             ChatDtos.RenameGroupDto dto = gson.fromJson(packet.getPayload(), ChatDtos.RenameGroupDto.class);
             Database.updateGroupChatName(dto.chatId, dto.newName);
             sendPacket(PacketType.RENAME_CHAT_RESPONSE, "OK");
@@ -375,7 +375,94 @@ public class TcpServer {
             int chatId = gson.fromJson(packet.getPayload(), Integer.class);
             Database.deleteGroupChatTransactional(chatId);
             sendPacket(PacketType.DELETE_CHAT_RESPONSE, "OK");
+        }*/
+
+        private void handleCreateChat(NetworkPacket packet) throws IOException {
+            ChatDtos.CreateGroupDto dto = gson.fromJson(packet.getPayload(), ChatDtos.CreateGroupDto.class);
+            Database.insertGroupChat(dto.groupName);
+            GroupChat newChat = Database.selectGroupChatByName(dto.groupName);
+
+            if (newChat != null) {
+                // 1. Adaugam membrii
+                Database.insertGroupMember(newChat.getId(), currentUser.getId());
+                Database.insertGroupMember(newChat.getId(), dto.targetUserId);
+
+                // Construim pachetul de Broadcast
+                NetworkPacket broadcastPacket = new NetworkPacket(PacketType.CREATE_CHAT_BROADCAST, currentUser.getId(), newChat);
+
+                // 2. IMI TRIMITE MIE (Ca sa apara in lista mea prin mecanismul de broadcast)
+                sendDirectPacket(broadcastPacket);
+
+                // 3. TRIMITE PARTENERULUI
+                sendToSpecificUser(dto.targetUserId, broadcastPacket);
+            }
         }
+
+        private void handleRenameChat(NetworkPacket packet) throws IOException {
+            ChatDtos.RenameGroupDto dto = gson.fromJson(packet.getPayload(), ChatDtos.RenameGroupDto.class);
+
+            // 1. Update DB
+            Database.updateGroupChatName(dto.chatId, dto.newName);
+
+            // Construim pachetul de Broadcast
+            NetworkPacket broadcastPacket = new NetworkPacket(PacketType.RENAME_CHAT_BROADCAST, currentUser.getId(), dto);
+
+            // 2. IMI TRIMITE MIE (Ca sa se actualizeze numele in lista mea)
+            sendDirectPacket(broadcastPacket);
+
+            // 3. BROADCAST CELORLALTI MEMBRI (Helperul meu sare peste sender, deci e perfect sa-l apelam dupa ce ne trimitem noua)
+            broadcastToChatMembers(dto.chatId, PacketType.RENAME_CHAT_BROADCAST, dto);
+        }
+
+        private void handleDeleteChat(NetworkPacket packet) throws IOException {
+            int chatId = gson.fromJson(packet.getPayload(), Integer.class);
+
+            // !!! LUAM MEMBRII INAINTE SA STERGEM CHATUL DIN DB !!!
+            List<GroupMember> members = Database.selectGroupMembersByChatId(chatId);
+
+            // 1. Stergerea efectiva
+            Database.deleteGroupChatTransactional(chatId);
+
+            // Construim pachetul de Broadcast
+            NetworkPacket broadcastPacket = new NetworkPacket(PacketType.DELETE_CHAT_BROADCAST, currentUser.getId(), chatId);
+
+            // 2. IMI TRIMITE MIE (Ca sa dispara din lista mea)
+            sendDirectPacket(broadcastPacket);
+
+            // 3. BROADCAST MANUAL CELORLALTI
+            if (members != null) {
+                for (GroupMember m : members) {
+                    if (m.getUserId() != currentUser.getId()) {
+                        sendToSpecificUser(m.getUserId(), broadcastPacket);
+                    }
+                }
+            }
+        }
+
+        // --- HELPER NOU CA SA NU SCRII COD DUPLICAT ---
+        private void sendToSpecificUser(int targetUserId, NetworkPacket p) {
+            synchronized (clients) {
+                for (ClientHandler client : clients) {
+                    if (client.currentUser != null && client.currentUser.getId() == targetUserId) {
+                        try { client.sendDirectPacket(p); } catch (Exception e) {}
+                        break;
+                    }
+                }
+            }
+        }
+
+        // --- HELPER PENTRU GRUPURI (Folosit la Rename) ---
+        private void broadcastToChatMembers(int chatId, PacketType type, Object payload) {
+            List<GroupMember> members = Database.selectGroupMembersByChatId(chatId);
+            if (members == null) return;
+            NetworkPacket p = new NetworkPacket(type, currentUser.getId(), payload);
+            for (GroupMember m : members) {
+                if (m.getUserId() != currentUser.getId()) {
+                    sendToSpecificUser(m.getUserId(), p);
+                }
+            }
+        }
+
         private void handleEditMessage(NetworkPacket packet) throws IOException {
             ChatDtos.EditMessageDto dto = gson.fromJson(packet.getPayload(), ChatDtos.EditMessageDto.class);
             if (Database.updateMessageById(dto.messageId, dto.newContent)) {
@@ -402,3 +489,4 @@ public class TcpServer {
         }
     }
 }
+
